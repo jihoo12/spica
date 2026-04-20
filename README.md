@@ -1,4 +1,4 @@
-## Rust Terminal Editor
+## Rust Text editor
 A minimalist, modal text editor built from scratch in Rust. This project demonstrates low-level terminal manipulation using libc to create a "Vim-like" editing experience directly in the console.
 
 ## 🚀 Features
