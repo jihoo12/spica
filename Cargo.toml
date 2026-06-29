@@ -1,7 +1,9 @@
 [package]
-name = "vii"
+name = "spica"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 libc = "0.2.180"
+#pilisp = { path = "../pi-lisp" }
+pilisp = { git = "https://github.com/pi-lisp/pi-lisp" }
