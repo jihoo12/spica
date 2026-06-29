@@ -195,6 +195,7 @@ impl EditorConfig {
                 Err(e) => self.status_msg = format!("Error: {}", e),
             },
             "q" => should_continue = false,
+            "q!" => should_continue = false,
             "wq" => {
                 let _ = self.save();
                 should_continue = false;
@@ -205,6 +206,9 @@ impl EditorConfig {
                     Ok(result) => self.status_msg = format!("=> {}", result),
                     Err(e) => self.status_msg = format!("pi error: {}", e),
                 }
+            }
+            "help" => {
+                self.status_msg = "Commands: w q q! wq pi <code> help".into();
             }
             _ => {
                 // Try user-defined commands from the plugin system
