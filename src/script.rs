@@ -285,6 +285,43 @@ pub fn trigger_hook(name: &str) {
     });
 }
 
+// ── Config file loading ─────────────────────────────────────
+
+fn expand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home, rest);
+        }
+    }
+    path.to_string()
+}
+
+pub fn load_config_files() {
+    let candidates = [
+        "./.spicarc.pi",
+        "~/.config/spica/init.pi",
+        "~/.spicarc.pi",
+    ];
+    for path in &candidates {
+        let expanded = expand_home(path);
+        if std::path::Path::new(&expanded).exists() {
+            let src = match std::fs::read_to_string(&expanded) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let _ = with_engine(|engine| {
+                let exprs = pilisp::parse_all(&src).ok()?;
+                let env = spica_env();
+                let heap = engine.heap();
+                for expr in &exprs {
+                    let _ = pilisp::eval(expr, env, heap).ok()?;
+                }
+                Some(())
+            });
+        }
+    }
+}
+
 // ── REPL eval (existing) ─────────────────────────────────────
 
 pub fn eval_string(src: &str) -> Result<String, String> {

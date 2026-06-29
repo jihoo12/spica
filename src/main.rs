@@ -50,18 +50,30 @@ fn get_terminal_size() -> (u16, u16) {
 
 fn draw_screen(config: &EditorConfig) {
     let visible_rows = (config.screen_rows - 1) as usize;
-    let visible_cols = config.screen_cols as usize;
+    let ln_width = if config.show_line_numbers {
+        (config.buffer.rows.len().to_string().len()).max(3)
+    } else {
+        0
+    };
+    let text_cols = (config.screen_cols as usize).saturating_sub(ln_width + 1);
 
     for y in 0..visible_rows {
         let file_row_idx = y + config.row_offset;
         print!("\x1b[K");
 
+        if config.show_line_numbers {
+            if file_row_idx < config.buffer.rows.len() {
+                print!("\x1b[2m{:>width$} \x1b[m", file_row_idx + 1, width = ln_width);
+            } else {
+                print!("\x1b[2m{:>width$} \x1b[m", "", width = ln_width);
+            }
+        }
+
         if file_row_idx < config.buffer.rows.len() {
             let row_content = &config.buffer.rows[file_row_idx].content;
-
             if row_content.len() > config.col_offset {
                 let mut line = row_content[config.col_offset..].to_string();
-                line.truncate(visible_cols);
+                line.truncate(text_cols);
                 print!("{}\r\n", line);
             } else {
                 print!("\r\n");
@@ -75,7 +87,11 @@ fn draw_screen(config: &EditorConfig) {
 fn draw_status_bar(config: &EditorConfig) {
     print!("\x1b[{};1H\x1b[K", config.screen_rows);
     if config.mode == Mode::Command {
-        print!(":{}", config.command_buffer);
+        if config.command_buffer.starts_with('/') {
+            print!("{}", config.command_buffer);
+        } else {
+            print!(":{}", config.command_buffer);
+        }
     } else {
         let mode_str = match config.mode {
             Mode::Normal => "-- NORMAL --",
@@ -95,7 +111,12 @@ fn refresh_screen(config: &mut EditorConfig) {
     draw_status_bar(config);
 
     let screen_y = config.cy - config.row_offset as u16;
-    let screen_x = config.cx - config.col_offset as u16;
+    let ln_width = if config.show_line_numbers {
+        (config.buffer.rows.len().to_string().len()).max(3) as u16 + 1
+    } else {
+        0
+    };
+    let screen_x = config.cx - config.col_offset as u16 + ln_width;
 
     print!("\x1b[{};{}H\x1b[?25h", screen_y + 1, screen_x + 1);
     io::stdout().flush().unwrap();
@@ -108,6 +129,7 @@ fn main() {
 
     // Initialize pi-lisp scripting
     script::init(&mut config);
+    script::load_config_files();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
