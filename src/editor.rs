@@ -126,21 +126,6 @@ impl EditorConfig {
         }
     }
 
-    pub fn save(&mut self) -> std::io::Result<()> {
-        let path = match &self.filename {
-            Some(name) => name.clone(),
-            None => {
-                self.status_msg = "No file name! Use :w <filename> (TBD)".into();
-                return Ok(());
-            }
-        };
-        let content = self.buffer.rows_to_string();
-        let mut file = File::create(&path)?;
-        file.write_all(content.as_bytes())?;
-        self.status_msg = format!("Saved to {}", path);
-        Ok(())
-    }
-
     pub fn handle_keypress(&mut self, key: char) -> bool {
         match self.mode {
             Mode::Normal => match key {
@@ -150,7 +135,11 @@ impl EditorConfig {
                     self.command_buffer.clear();
                 }
                 'h' | 'j' | 'k' | 'l' => self.move_cursor(key),
-                _ => {}
+                _ => {
+                    if crate::script::dispatch_key("normal", key) {
+                        return true;
+                    }
+                }
             },
             Mode::Insert => match key {
                 '\x1b' => self.mode = Mode::Normal,
@@ -162,17 +151,39 @@ impl EditorConfig {
                 }
                 '\x7f' | '\x08' => self.delete_char(),
                 c if !c.is_control() => self.insert_char(c),
-                _ => {}
+                _ => {
+                    crate::script::dispatch_key("insert", key);
+                }
             },
             Mode::Command => match key {
                 '\x1b' => self.mode = Mode::Normal,
                 '\r' | '\n' => return self.execute_command(),
                 '\x7f' | '\x08' => { self.command_buffer.pop(); }
                 c if !c.is_control() => self.command_buffer.push(c),
-                _ => {}
+                _ => {
+                    crate::script::dispatch_key("command", key);
+                }
             },
         }
         true
+    }
+
+    pub fn save(&mut self) -> std::io::Result<()> {
+        crate::script::trigger_hook("before-save");
+        let path = match &self.filename {
+            Some(name) => name.clone(),
+            None => {
+                self.status_msg = "No file name! Use :w <filename> (TBD)".into();
+                crate::script::trigger_hook("after-save");
+                return Ok(());
+            }
+        };
+        let content = self.buffer.rows_to_string();
+        let mut file = File::create(&path)?;
+        file.write_all(content.as_bytes())?;
+        self.status_msg = format!("Saved to {}", path);
+        crate::script::trigger_hook("after-save");
+        Ok(())
     }
 
     pub fn execute_command(&mut self) -> bool {
@@ -195,7 +206,12 @@ impl EditorConfig {
                     Err(e) => self.status_msg = format!("pi error: {}", e),
                 }
             }
-            _ => self.status_msg = format!("Unknown: {}", cmd),
+            _ => {
+                // Try user-defined commands from the plugin system
+                if !crate::script::dispatch_command(cmd) {
+                    self.status_msg = format!("Unknown: {}", cmd);
+                }
+            }
         }
         self.mode = Mode::Normal;
         self.command_buffer.clear();

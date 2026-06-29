@@ -1,12 +1,36 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 
-use pilisp::{Expr, PiLisp, env_set};
+use pilisp::{Expr, PiLisp, new_env};
 
 use crate::editor::EditorConfig;
+
+fn expr_eq(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Symbol(a), Expr::Symbol(b)) => a == b,
+        (Expr::Str(a), Expr::Str(b)) => a == b,
+        (Expr::Int(a), Expr::Int(b)) => a == b,
+        (Expr::Float(a), Expr::Float(b)) => (a - b).abs() < f64::EPSILON,
+        (Expr::Complex(ra, ia), Expr::Complex(rb, ib)) => (ra - rb).abs() < f64::EPSILON && (ia - ib).abs() < f64::EPSILON,
+        (Expr::Bool(a), Expr::Bool(b)) => a == b,
+        (Expr::List(a), Expr::List(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| expr_eq(x, y)),
+        (Expr::Lambda(pa, ba, _), Expr::Lambda(pb, bb, _)) => pa == pb && expr_eq(ba, bb),
+        _ => false,
+    }
+}
+
+fn env_set(heap: &mut pilisp::Heap, env: pilisp::Env, name: &str, val: Expr) {
+    heap.env_set(env, name.to_string(), val);
+}
+
+fn env_get(heap: &pilisp::Heap, env: pilisp::Env, name: &str) -> Result<Expr, String> {
+    heap.env_get(env, name)
+}
 
 thread_local! {
     static EDITOR: RefCell<*mut EditorConfig> = const { RefCell::new(std::ptr::null_mut()) };
     static ENGINE: RefCell<Option<PiLisp>> = const { RefCell::new(None) };
+    static SPICA_ENV: RefCell<Option<pilisp::Env>> = const { RefCell::new(None) };
 }
 
 fn with_engine<F, T>(f: F) -> T
@@ -16,6 +40,12 @@ where
     ENGINE.with(|e| f(e.borrow_mut().as_mut().expect("pi-lisp engine not initialized")))
 }
 
+fn spica_env() -> pilisp::Env {
+    SPICA_ENV.with(|h| h.borrow().expect("spica env not initialized"))
+}
+
+// ── Initialization ───────────────────────────────────────────
+
 pub fn init(editor: &mut EditorConfig) {
     EDITOR.with(|e| *e.borrow_mut() = editor as *mut EditorConfig);
 
@@ -23,137 +53,239 @@ pub fn init(editor: &mut EditorConfig) {
         *cell.borrow_mut() = Some(PiLisp::new());
     });
 
-    register_editor_builtins();
+    with_engine(|engine| {
+        let global = engine.env();
+        let heap = engine.heap();
+        let spica_env = new_env(heap, Some(global));
+
+        heap.env_set(spica_env, "*spica-keymaps*".into(), Expr::List(vec![]));
+        heap.env_set(spica_env, "*spica-commands*".into(), Expr::List(vec![]));
+        heap.env_set(spica_env, "*spica-hooks*".into(), Expr::List(vec![]));
+
+        SPICA_ENV.with(|h| *h.borrow_mut() = Some(spica_env));
+    });
+
+    register_spica_builtins();
 }
 
-fn register_editor_builtins() {
+fn register_spica_builtins() {
     with_engine(|engine| {
-        let env = engine.env();
+        let global_env = engine.env();
+        let env = global_env;
         let heap = engine.heap();
 
-        env_set(heap, env, "editor-get-cursor".into(), Expr::Func(std::rc::Rc::new(|_args, _heap| {
-            EDITOR.with(|e| {
-                let cfg = unsafe { &**e.borrow() };
-                Ok(Expr::List(vec![Expr::Int(cfg.cx as i64), Expr::Int(cfg.cy as i64)]))
-            })
+        // (define-key mode key-str fn)
+        // Stores (mode . key) -> fn in *spica-keymaps*
+        // mode is a symbol: 'normal, 'insert, 'command
+        // key-str is a string: "j", "C-p", "RET", etc.
+        env_set(heap, env, "define-key", Expr::Func(Rc::new(move |args, heap| {
+            if args.len() != 3 {
+                return Err("define-key: expected (define-key mode key-str fn)".into());
+            }
+            let entry = Expr::List(vec![
+                Expr::List(vec![args[0].clone(), args[1].clone()]),
+                args[2].clone(),
+            ]);
+            let spica_env = spica_env();
+            let mut keymaps = env_get(heap, spica_env, "*spica-keymaps*")
+                .unwrap_or(Expr::List(vec![]));
+            if let Expr::List(ref mut list) = keymaps {
+                list.push(entry);
+            }
+            env_set(heap, spica_env, "*spica-keymaps*", keymaps);
+            Ok(Expr::List(vec![]))
         })));
 
-        env_set(heap, env, "editor-set-cursor!".into(), Expr::Func(std::rc::Rc::new(|args, _heap| {
+        // (define-command name fn)
+        env_set(heap, env, "define-command", Expr::Func(Rc::new(move |args, heap| {
             if args.len() != 2 {
-                return Err("editor-set-cursor!: expected 2 args (x y)".into());
+                return Err("define-command: expected (define-command name fn)".into());
             }
-            let x = match &args[0] { Expr::Int(n) => *n as u16, _ => return Err("x must be int".into()) };
-            let y = match &args[1] { Expr::Int(n) => *n as u16, _ => return Err("y must be int".into()) };
-            EDITOR.with(|e| {
-                let cfg = unsafe { &mut **e.borrow_mut() };
-                cfg.cx = x;
-                cfg.cy = y;
-            });
+            let entry = Expr::List(vec![args[0].clone(), args[1].clone()]);
+            let spica_env = spica_env();
+            let mut cmds = env_get(heap, spica_env, "*spica-commands*")
+                .unwrap_or(Expr::List(vec![]));
+            if let Expr::List(ref mut list) = cmds {
+                list.push(entry);
+            }
+            env_set(heap, spica_env, "*spica-commands*", cmds);
             Ok(Expr::List(vec![]))
         })));
 
-        env_set(heap, env, "editor-get-line".into(), Expr::Func(std::rc::Rc::new(|args, _heap| {
+        // (add-hook hook-name fn)
+        env_set(heap, env, "add-hook", Expr::Func(Rc::new(move |args, heap| {
+            if args.len() != 2 {
+                return Err("add-hook: expected (add-hook hook-name fn)".into());
+            }
+            let spica_env = spica_env();
+            let mut hooks = env_get(heap, spica_env, "*spica-hooks*")
+                .unwrap_or(Expr::List(vec![]));
+            let mut found = false;
+            if let Expr::List(ref mut list) = hooks {
+                for item in list.iter_mut() {
+                    if let Expr::List(pair) = item {
+                        if pair.len() == 2 && expr_eq(&pair[0], &args[0]) {
+                            if let Expr::List(ref mut fns) = pair[1] {
+                                fns.push(args[1].clone());
+                                found = true;
+                            }
+                        }
+                    }
+                }
+                if !found {
+                    list.push(Expr::List(vec![
+                        args[0].clone(),
+                        Expr::List(vec![args[1].clone()]),
+                    ]));
+                }
+            }
+            env_set(heap, spica_env, "*spica-hooks*", hooks);
+            Ok(Expr::List(vec![]))
+        })));
+
+        // (remove-hook hook-name) — remove all handlers for a hook
+        env_set(heap, env, "remove-hook", Expr::Func(Rc::new(move |args, heap| {
+            if args.len() < 1 || args.len() > 2 {
+                return Err("remove-hook: expected (remove-hook hook-name)".into());
+            }
+            let spica_env = spica_env();
+            let mut hooks = env_get(heap, spica_env, "*spica-hooks*")
+                .unwrap_or(Expr::List(vec![]));
+            if let Expr::List(ref mut list) = hooks {
+                list.retain(|item| {
+                    if let Expr::List(pair) = item {
+                        if pair.len() >= 1 && expr_eq(&pair[0], &args[0]) {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+            env_set(heap, spica_env, "*spica-hooks*", hooks);
+            Ok(Expr::List(vec![]))
+        })));
+
+        // (run-hooks hook-name) — callable from Lisp too
+        env_set(heap, env, "run-hooks", Expr::Func(Rc::new(move |args, heap| {
             if args.len() != 1 {
-                return Err("editor-get-line: expected 1 arg (n)".into());
+                return Err("run-hooks: expected (run-hooks hook-name)".into());
             }
-            let n = match &args[0] { Expr::Int(i) => *i as usize, _ => return Err("n must be int".into()) };
-            EDITOR.with(|e| {
-                let cfg = unsafe { &**e.borrow() };
-                if n < cfg.buffer.rows.len() {
-                    Ok(Expr::Str(cfg.buffer.rows[n].content.clone()))
-                } else {
-                    Ok(Expr::List(vec![]))
-                }
-            })
+            let spica_env = spica_env();
+            let hooks = env_get(heap, spica_env, "*spica-hooks*").unwrap_or(Expr::List(vec![]));
+            run_hooks_inner(heap, spica_env, &hooks, &args[0])
         })));
 
-        env_set(heap, env, "editor-get-buffer".into(), Expr::Func(std::rc::Rc::new(|_args, _heap| {
-            EDITOR.with(|e| {
-                let cfg = unsafe { &**e.borrow() };
-                let lines: Vec<Expr> = cfg.buffer.rows.iter().map(|r| Expr::Str(r.content.clone())).collect();
-                Ok(Expr::List(lines))
-            })
-        })));
-
-        env_set(heap, env, "editor-set-status!".into(), Expr::Func(std::rc::Rc::new(|args, _heap| {
+        // (spica-load path) — load a .pi file at runtime
+        env_set(heap, env, "spica-load", Expr::Func(Rc::new(move |args, heap| {
             if args.len() != 1 {
-                return Err("editor-set-status!: expected 1 arg (msg)".into());
+                return Err("spica-load: expected (spica-load path)".into());
             }
-            let msg = match &args[0] {
-                Expr::Str(s) => s.clone(),
-                Expr::Int(n) => n.to_string(),
-                Expr::Float(f) => f.to_string(),
-                Expr::Bool(b) => (if *b { "#t" } else { "#f" }).to_string(),
-                other => format!("{:?}", other),
-            };
-            EDITOR.with(|e| unsafe { &mut **e.borrow_mut() }.status_msg = msg);
-            Ok(Expr::List(vec![]))
-        })));
-
-        env_set(heap, env, "editor-get-mode".into(), Expr::Func(std::rc::Rc::new(|_args, _heap| {
-            EDITOR.with(|e| {
-                let mode_str = match unsafe { &**e.borrow() }.mode {
-                    crate::editor::Mode::Normal => "normal",
-                    crate::editor::Mode::Insert => "insert",
-                    crate::editor::Mode::Command => "command",
-                };
-                Ok(Expr::Str(mode_str.into()))
-            })
-        })));
-
-        env_set(heap, env, "editor-line-count".into(), Expr::Func(std::rc::Rc::new(|_args, _heap| {
-            EDITOR.with(|e| {
-                let count = unsafe { &**e.borrow() }.buffer.rows.len();
-                Ok(Expr::Int(count as i64))
-            })
-        })));
-
-        env_set(heap, env, "editor-get-filename".into(), Expr::Func(std::rc::Rc::new(|_args, _heap| {
-            EDITOR.with(|e| {
-                match &unsafe { &**e.borrow() }.filename {
-                    Some(name) => Ok(Expr::Str(name.clone())),
-                    None => Ok(Expr::List(vec![])),
-                }
-            })
-        })));
-
-        env_set(heap, env, "editor-insert-char".into(), Expr::Func(std::rc::Rc::new(|args, _heap| {
-            if args.len() != 1 {
-                return Err("editor-insert-char: expected 1 arg (c)".into());
+            let path = match &args[0] { Expr::Str(s) => s.clone(), other => return Err(format!("path must be string, got {:?}", other)) };
+            let src = std::fs::read_to_string(&path)
+                .map_err(|e| format!("spica-load: {}: {}", path, e))?;
+            let exprs = pilisp::parse_all(&src)
+                .map_err(|e| format!("spica-load: parse error: {}", e))?;
+            let mut result = Expr::List(vec![]);
+            for expr in &exprs {
+                result = pilisp::eval(expr, spica_env(), heap)?;
             }
-            let c = match &args[0] {
-                Expr::Int(n) if *n >= 0 && *n <= 255 => *n as u8 as char,
-                _ => return Err("editor-insert-char: arg must be an int codepoint".into()),
-            };
-            EDITOR.with(|e| {
-                let cfg = unsafe { &mut **e.borrow_mut() };
-                cfg.buffer.rows[cfg.cy as usize].insert_char(cfg.cx as usize, c);
-                cfg.cx += 1;
-            });
-            Ok(Expr::List(vec![]))
+            Ok(result)
         })));
+    });
+}
 
-        env_set(heap, env, "editor-delete-char".into(), Expr::Func(std::rc::Rc::new(|_args, _heap| {
-            EDITOR.with(|e| {
-                let cfg = unsafe { &mut **e.borrow_mut() };
-                if cfg.cx > 0 {
-                    cfg.buffer.rows[cfg.cy as usize].delete_char(cfg.cx as usize - 1);
-                    cfg.cx -= 1;
+fn run_hooks_inner(heap: &mut pilisp::Heap, spica_env: pilisp::Env, hooks: &Expr, hook_name: &Expr) -> Result<Expr, String> {
+    if let Expr::List(list) = hooks {
+        for item in list {
+            if let Expr::List(pair) = item {
+                if pair.len() == 2 && expr_eq(&pair[0], hook_name) {
+                    if let Expr::List(fns) = &pair[1] {
+                        for fn_expr in fns {
+                            let call = Expr::List(vec![fn_expr.clone()]);
+                            pilisp::eval(&call, spica_env, heap)?;
+                        }
+                    }
                 }
-            });
-            Ok(Expr::List(vec![]))
-        })));
+            }
+        }
+    }
+    Ok(Expr::List(vec![]))
+}
 
-        env_set(heap, env, "editor-save".into(), Expr::Func(std::rc::Rc::new(|_args, _heap| {
-            EDITOR.with(|e| {
-                match unsafe { &mut **e.borrow_mut() }.save() {
-                    Ok(()) => Ok(Expr::Bool(true)),
-                    Err(_) => Ok(Expr::Bool(false)),
+// ── Public dispatch API (called from editor.rs / main.rs) ────
+
+/// Look up and call a key handler. Returns true if a handler was found and called.
+pub fn dispatch_key(mode: &str, key_char: char) -> bool {
+    with_engine(|engine| {
+        let heap = engine.heap();
+        let spica_env = spica_env();
+        let keymaps = match env_get(heap, spica_env, "*spica-keymaps*") {
+            Ok(Expr::List(list)) => list,
+            _ => return false,
+        };
+
+        let mode_expr = Expr::Symbol(mode.to_string());
+        let key_expr = Expr::Str(key_char.to_string());
+
+        for item in &keymaps {
+            if let Expr::List(pair) = item {
+                if pair.len() == 2 {
+                    if let Expr::List(key_spec) = &pair[0] {
+                        if key_spec.len() == 2 && expr_eq(&key_spec[0], &mode_expr) && expr_eq(&key_spec[1], &key_expr) {
+                            let handler = &pair[1];
+                            let call = Expr::List(vec![handler.clone()]);
+                            let _ = pilisp::eval(&call, spica_env, heap);
+                            return true;
+                        }
+                    }
                 }
-            })
-        })));
+            }
+        }
+        false
     })
 }
+
+/// Look up and execute a user command. Returns true if found.
+pub fn dispatch_command(cmd: &str) -> bool {
+    with_engine(|engine| {
+        let heap = engine.heap();
+        let spica_env = spica_env();
+        let cmds = match env_get(heap, spica_env, "*spica-commands*") {
+            Ok(Expr::List(list)) => list,
+            _ => return false,
+        };
+
+        let cmd_expr = Expr::Str(cmd.to_string());
+
+        for item in &cmds {
+            if let Expr::List(pair) = item {
+                if pair.len() == 2 && expr_eq(&pair[0], &cmd_expr) {
+                    let handler = &pair[1];
+                    let call = Expr::List(vec![handler.clone(), cmd_expr.clone()]);
+                    let _ = pilisp::eval(&call, spica_env, heap);
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
+/// Trigger all handlers registered for a hook.
+pub fn trigger_hook(name: &str) {
+    with_engine(|engine| {
+        let heap = engine.heap();
+        let spica_env = spica_env();
+        let hooks = match env_get(heap, spica_env, "*spica-hooks*") {
+            Ok(h) => h,
+            _ => return,
+        };
+        let hook_name = Expr::Symbol(name.to_string());
+        let _ = run_hooks_inner(heap, spica_env, &hooks, &hook_name);
+    });
+}
+
+// ── REPL eval (existing) ─────────────────────────────────────
 
 pub fn eval_string(src: &str) -> Result<String, String> {
     let result = with_engine(|engine| engine.eval(src))?;
